@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,8 @@ func (s *Session) Dial(ctx context.Context, remoteAddr string) (net.Conn, error)
 	id := atomic.AddUint64(&s.nextID, 1)
 	conn := newTunnelConn(id, s)
 	s.conns.Store(id, conn)
+
+	log.Printf("tunnel session: dialing %s (connID=%d)", remoteAddr, id)
 
 	s.writeMu.Lock()
 	err := s.rw.WriteRecord(EncodeOpen(id, remoteAddr))
@@ -99,14 +102,17 @@ func (s *Session) closeAll() {
 
 func (s *Session) readLoop() {
 	defer s.wg.Done()
+	log.Printf("tunnel session: read loop started")
 	for {
 		record, err := s.rw.ReadRecord()
 		if err != nil {
+			log.Printf("tunnel session: read loop ended: %v", err)
 			s.close()
 			return
 		}
 		msg, err := Decode(record)
 		if err != nil {
+			log.Printf("tunnel session: decode error: %v", err)
 			continue
 		}
 		switch msg.Type {
@@ -121,6 +127,9 @@ func (s *Session) readLoop() {
 }
 
 func (s *Session) handleOpen(msg Message) {
+	addr := string(msg.Payload)
+	log.Printf("tunnel session: open request connID=%d addr=%s", msg.ConnID, addr)
+
 	conn := newTunnelConn(msg.ConnID, s)
 	s.conns.Store(msg.ConnID, conn)
 
@@ -129,6 +138,7 @@ func (s *Session) handleOpen(msg Message) {
 	s.listenerMu.Unlock()
 
 	if ln == nil {
+		log.Printf("tunnel session: no listener, rejecting connID=%d", msg.ConnID)
 		s.sendClose(msg.ConnID)
 		s.conns.Delete(msg.ConnID)
 		return
@@ -136,10 +146,12 @@ func (s *Session) handleOpen(msg Message) {
 
 	select {
 	case ln.connCh <- conn:
+		log.Printf("tunnel session: accepted tunnel connID=%d", msg.ConnID)
 	case <-s.stopCh:
 		s.sendClose(msg.ConnID)
 		s.conns.Delete(msg.ConnID)
 	default:
+		log.Printf("tunnel session: listener full, rejecting connID=%d", msg.ConnID)
 		s.sendClose(msg.ConnID)
 		s.conns.Delete(msg.ConnID)
 	}
@@ -155,6 +167,7 @@ func (s *Session) handleData(msg Message) {
 }
 
 func (s *Session) handleClose(msg Message) {
+	log.Printf("tunnel session: close connID=%d", msg.ConnID)
 	val, ok := s.conns.Load(msg.ConnID)
 	if !ok {
 		return

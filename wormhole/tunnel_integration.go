@@ -2,16 +2,28 @@ package wormhole
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"math"
 	"strconv"
 
 	"github.com/psanford/wormhole-william/internal/crypto"
 	"github.com/psanford/wormhole-william/rendezvous"
 	"github.com/psanford/wormhole-william/wormhole/tunnel"
 	"github.com/psanford/wormhole-william/wordlist"
+	"crypto/sha256"
+	"golang.org/x/crypto/hkdf"
 )
+
+const TunnelAppID = "abakum.github.io/wormhole/tunnel"
+
+func (c *Client) tunnelAppID() string {
+	return TunnelAppID
+}
 
 type cryptorAdapter struct {
 	c *transportCryptor
@@ -38,6 +50,8 @@ func waitForTransitMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (*tr
 			continue
 		}
 		if gm.Transit != nil {
+			directCount, relayCount := countTransitHints(gm.Transit)
+			log.Printf("tunnel: received peer transit hints (%d direct, %d relay)", directCount, relayCount)
 			return gm.Transit, nil
 		}
 		if gm.Error != nil {
@@ -46,28 +60,73 @@ func waitForTransitMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (*tr
 	}
 }
 
-func (c *Client) CreateTunnel(ctx context.Context) (string, *tunnel.Tunnel, error) {
-	if err := c.validateRelayAddr(); err != nil {
-		return "", nil, fmt.Errorf("invalid TransitRelayAddress: %s", err)
+func countTransitHints(t *transitMsg) (direct, relay int) {
+	for _, h := range t.HintsV1 {
+		switch h.Type {
+		case "direct-tcp-v1":
+			direct++
+		case "relay-v1":
+			relay++
+		}
+	}
+	return
+}
+
+func deterministicNameplates(secret string, count int) []string {
+	candidates := make([]string, count)
+	for i := 0; i < count; i++ {
+		digits := i + 1
+		min := int(math.Pow10(digits - 1))
+		max := int(math.Pow10(digits)) - 1
+
+		purpose := fmt.Sprintf("wormhole:tunnel:nameplate-%d", i)
+		h := hkdf.New(sha256.New, []byte(secret), nil, []byte(purpose))
+		buf := make([]byte, 4)
+		io.ReadFull(h, buf)
+
+		n := min + int(binary.BigEndian.Uint32(buf)%uint32(max-min+1))
+		candidates[i] = strconv.Itoa(n)
+	}
+	return candidates
+}
+
+func (c *Client) claimOrAllocateNameplate(ctx context.Context, secret string) (string, *rendezvous.Client, string, error) {
+	appID := c.tunnelAppID()
+
+	if secret == "" {
+		sideID := crypto.RandSideID()
+		rc := rendezvous.NewClient(c.url(), sideID, appID)
+		if _, err := rc.Connect(ctx); err != nil {
+			return "", nil, "", err
+		}
+		nameplate, err := rc.CreateMailbox(ctx)
+		if err != nil {
+			return "", nil, "", err
+		}
+		log.Printf("tunnel: allocated nameplate %s", nameplate)
+		return nameplate, rc, sideID, nil
 	}
 
-	sideID := crypto.RandSideID()
-	appID := c.appID()
-	rc := rendezvous.NewClient(c.url(), sideID, appID)
-
-	_, err := rc.Connect(ctx)
-	if err != nil {
-		return "", nil, err
+	candidates := deterministicNameplates(secret, 5)
+	for _, nameplate := range candidates {
+		sideID := crypto.RandSideID()
+		rc := rendezvous.NewClient(c.url(), sideID, appID)
+		if _, err := rc.Connect(ctx); err != nil {
+			log.Printf("tunnel: connect failed for nameplate %s: %v", nameplate, err)
+			continue
+		}
+		if err := rc.AttachMailbox(ctx, nameplate); err != nil {
+			log.Printf("tunnel: nameplate %s busy (%v), trying next", nameplate, err)
+			continue
+		}
+		log.Printf("tunnel: claimed deterministic nameplate %s", nameplate)
+		return nameplate, rc, sideID, nil
 	}
+	return "", nil, "", fmt.Errorf("all %d deterministic nameplates busy, try a different secret", len(candidates))
+}
 
-	nameplate, err := rc.CreateMailbox(ctx)
-	if err != nil {
-		return "", nil, err
-	}
-
-	code := nameplate + "-" + wordlist.ChooseWords(c.wordCount())
-
-	cp := newClientProtocol(ctx, rc, sideID, appID)
+func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sideID, code string, isJoiner bool) (string, *tunnel.Tunnel, error) {
+	appID := c.tunnelAppID()
 
 	var returnErr error
 	defer func() {
@@ -75,6 +134,8 @@ func (c *Client) CreateTunnel(ctx context.Context) (string, *tunnel.Tunnel, erro
 			rc.Close(ctx, rendezvous.Errory)
 		}
 	}()
+
+	cp := newClientProtocol(ctx, rc, sideID, appID)
 
 	if err := cp.WritePake(ctx, code); err != nil {
 		returnErr = err
@@ -84,6 +145,8 @@ func (c *Client) CreateTunnel(ctx context.Context) (string, *tunnel.Tunnel, erro
 		returnErr = err
 		return "", nil, err
 	}
+	log.Printf("tunnel: PAKE exchange complete (code confirmed)")
+
 	if err := cp.WriteVersion(ctx); err != nil {
 		returnErr = err
 		return "", nil, err
@@ -92,6 +155,7 @@ func (c *Client) CreateTunnel(ctx context.Context) (string, *tunnel.Tunnel, erro
 		returnErr = err
 		return "", nil, err
 	}
+	log.Printf("tunnel: version exchange complete")
 
 	if c.VerifierOk != nil {
 		verifier, err := cp.Verifier()
@@ -108,6 +172,59 @@ func (c *Client) CreateTunnel(ctx context.Context) (string, *tunnel.Tunnel, erro
 	transitKey := deriveTransitKey(cp.sharedKey, appID)
 	transport := newFileTransport(transitKey, appID, c.relayAddr())
 
+	if isJoiner {
+		log.Printf("tunnel: waiting for peer transit hints...")
+		peerTransit, err := waitForTransitMsg(cp.ch, cp.sharedKey)
+		if err != nil {
+			returnErr = err
+			return "", nil, err
+		}
+
+		transitMsg, err := transport.makeTransitMsg()
+		if err != nil {
+			returnErr = fmt.Errorf("make transit msg error: %s", err)
+			return "", nil, err
+		}
+
+		if err := cp.WriteAppData(ctx, &genericMessage{Transit: transitMsg}); err != nil {
+			returnErr = err
+			return "", nil, err
+		}
+
+		log.Printf("tunnel: trying direct connection to peer...")
+		conn, err := transport.connectDirect(peerTransit)
+		if err != nil {
+			returnErr = err
+			return "", nil, err
+		}
+
+		if conn != nil {
+			log.Printf("tunnel: transit connection established via direct-tcp from %s", conn.RemoteAddr())
+		} else {
+			log.Printf("tunnel: direct connection failed, trying relay...")
+			conn, err = transport.connectViaRelay(peerTransit)
+			if err != nil {
+				returnErr = err
+				return "", nil, err
+			}
+			if conn != nil {
+				log.Printf("tunnel: transit connection established via relay from %s", conn.RemoteAddr())
+			}
+		}
+
+		if conn == nil {
+			returnErr = errors.New("failed to establish transit connection (both direct and relay failed)")
+			return "", nil, returnErr
+		}
+
+		cryptor := newTransportCryptor(conn, transitKey, "transit_record_sender_key", "transit_record_receiver_key")
+		session := tunnel.NewSession(&cryptorAdapter{cryptor})
+
+		rc.Close(ctx, rendezvous.Happy)
+
+		return code, tunnel.NewTunnel(session), nil
+	}
+
 	if err := transport.listen(); err != nil {
 		returnErr = err
 		return "", nil, err
@@ -123,6 +240,9 @@ func (c *Client) CreateTunnel(ctx context.Context) (string, *tunnel.Tunnel, erro
 		return "", nil, err
 	}
 
+	directCount, relayCount := countTransitHints(transitMsg)
+	log.Printf("tunnel: transit listening (direct hints=%d, relay hints=%d, relay addr=%s)", directCount, relayCount, c.relayAddr())
+
 	if err := cp.WriteAppData(ctx, &genericMessage{Transit: transitMsg}); err != nil {
 		returnErr = err
 		return "", nil, err
@@ -134,11 +254,14 @@ func (c *Client) CreateTunnel(ctx context.Context) (string, *tunnel.Tunnel, erro
 		return "", nil, err
 	}
 
+	log.Printf("tunnel: waiting for incoming transit connection...")
 	conn, err := transport.acceptConnection(ctx)
 	if err != nil {
 		returnErr = err
 		return "", nil, err
 	}
+
+	log.Printf("tunnel: transit connection established from %s", conn.RemoteAddr())
 
 	cryptor := newTransportCryptor(conn, transitKey, "transit_record_receiver_key", "transit_record_sender_key")
 	session := tunnel.NewSession(&cryptorAdapter{cryptor})
@@ -148,219 +271,45 @@ func (c *Client) CreateTunnel(ctx context.Context) (string, *tunnel.Tunnel, erro
 	return code, tunnel.NewTunnel(session), nil
 }
 
-func (c *Client) CreateTunnelWithCode(ctx context.Context, code string) (*tunnel.Tunnel, error) {
+func (c *Client) CreateTunnel(ctx context.Context, code string) (string, *tunnel.Tunnel, error) {
 	if err := c.validateRelayAddr(); err != nil {
-		return nil, fmt.Errorf("invalid TransitRelayAddress: %s", err)
+		return "", nil, fmt.Errorf("invalid TransitRelayAddress: %s", err)
 	}
 
-	nameplate, err := nameplateFromCode(code)
+	log.Printf("tunnel: connecting to rendezvous %s", c.url())
+
+	nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code)
 	if err != nil {
-		return nil, fmt.Errorf("invalid code for tunnel: %w", err)
+		return "", nil, fmt.Errorf("claim nameplate: %w", err)
 	}
 
-	sideID := crypto.RandSideID()
-	appID := c.appID()
-	rc := rendezvous.NewClient(c.url(), sideID, appID)
-
-	var returnErr error
-	defer func() {
-		if returnErr != nil {
-			rc.Close(ctx, rendezvous.Errory)
-		}
-	}()
-
-	_, err = rc.Connect(ctx)
-	if err != nil {
-		returnErr = err
-		return nil, err
+	if code == "" {
+		code = nameplate + "-" + wordlist.ChooseWords(c.wordCount())
+		log.Printf("tunnel: created mailbox, code=%q", code)
+	} else {
+		log.Printf("tunnel: claimed nameplate %s for code", nameplate)
 	}
 
-	if err := rc.AttachMailbox(ctx, nameplate); err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	cp := newClientProtocol(ctx, rc, sideID, appID)
-
-	if err := cp.WritePake(ctx, code); err != nil {
-		returnErr = err
-		return nil, err
-	}
-	if err := cp.ReadPake(ctx); err != nil {
-		returnErr = err
-		return nil, err
-	}
-	if err := cp.WriteVersion(ctx); err != nil {
-		returnErr = err
-		return nil, err
-	}
-	if _, err := cp.ReadVersion(); err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	if c.VerifierOk != nil {
-		verifier, err := cp.Verifier()
-		if err != nil {
-			returnErr = err
-			return nil, err
-		}
-		if ok := c.VerifierOk(hex.EncodeToString(verifier)); !ok {
-			returnErr = errors.New("tunnel rejected by verification check")
-			return nil, returnErr
-		}
-	}
-
-	transitKey := deriveTransitKey(cp.sharedKey, appID)
-	transport := newFileTransport(transitKey, appID, c.relayAddr())
-
-	if err := transport.listen(); err != nil {
-		returnErr = err
-		return nil, err
-	}
-	if err := transport.listenRelay(); err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	transitMsg, err := transport.makeTransitMsg()
-	if err != nil {
-		returnErr = fmt.Errorf("make transit msg error: %s", err)
-		return nil, err
-	}
-
-	if err := cp.WriteAppData(ctx, &genericMessage{Transit: transitMsg}); err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	_, err = waitForTransitMsg(cp.ch, cp.sharedKey)
-	if err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	conn, err := transport.acceptConnection(ctx)
-	if err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	cryptor := newTransportCryptor(conn, transitKey, "transit_record_receiver_key", "transit_record_sender_key")
-	session := tunnel.NewSession(&cryptorAdapter{cryptor})
-
-	rc.Close(ctx, rendezvous.Happy)
-
-	return tunnel.NewTunnel(session), nil
+	return c.establishTunnel(ctx, rc, sideID, code, false)
 }
 
-func (c *Client) JoinTunnel(ctx context.Context, code string) (*tunnel.Tunnel, error) {
+func (c *Client) JoinTunnel(ctx context.Context, code string) (string, *tunnel.Tunnel, error) {
 	if err := c.validateRelayAddr(); err != nil {
-		return nil, fmt.Errorf("invalid TransitRelayAddress: %s", err)
+		return "", nil, fmt.Errorf("invalid TransitRelayAddress: %s", err)
 	}
 
-	sideID := crypto.RandSideID()
-	appID := c.appID()
-	rc := rendezvous.NewClient(c.url(), sideID, appID)
+	if code == "" {
+		return "", nil, errors.New("join tunnel: code is required")
+	}
 
-	var returnErr error
-	defer func() {
-		if returnErr != nil {
-			rc.Close(ctx, rendezvous.Errory)
-		}
-	}()
+	log.Printf("tunnel: connecting to rendezvous %s", c.url())
 
-	_, err := rc.Connect(ctx)
+	nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code)
 	if err != nil {
-		returnErr = err
-		return nil, err
+		return "", nil, fmt.Errorf("claim nameplate: %w", err)
 	}
 
-	nameplate, err := nameplateFromCode(code)
-	if err != nil {
-		returnErr = err
-		return nil, err
-	}
+	log.Printf("tunnel: claimed nameplate %s for code", nameplate)
 
-	if err := rc.AttachMailbox(ctx, nameplate); err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	cp := newClientProtocol(ctx, rc, sideID, appID)
-
-	if err := cp.WritePake(ctx, code); err != nil {
-		returnErr = err
-		return nil, err
-	}
-	if err := cp.ReadPake(ctx); err != nil {
-		returnErr = err
-		return nil, err
-	}
-	if err := cp.WriteVersion(ctx); err != nil {
-		returnErr = err
-		return nil, err
-	}
-	if _, err := cp.ReadVersion(); err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	if c.VerifierOk != nil {
-		verifier, err := cp.Verifier()
-		if err != nil {
-			returnErr = err
-			return nil, err
-		}
-		if ok := c.VerifierOk(hex.EncodeToString(verifier)); !ok {
-			returnErr = errors.New("tunnel rejected by verification check")
-			return nil, returnErr
-		}
-	}
-
-	peerTransit, err := waitForTransitMsg(cp.ch, cp.sharedKey)
-	if err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	transitKey := deriveTransitKey(cp.sharedKey, appID)
-	transport := newFileTransport(transitKey, appID, c.relayAddr())
-
-	transitMsg, err := transport.makeTransitMsg()
-	if err != nil {
-		returnErr = fmt.Errorf("make transit msg error: %s", err)
-		return nil, err
-	}
-
-	if err := cp.WriteAppData(ctx, &genericMessage{Transit: transitMsg}); err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	conn, err := transport.connectDirect(peerTransit)
-	if err != nil {
-		returnErr = err
-		return nil, err
-	}
-
-	if conn == nil {
-		conn, err = transport.connectViaRelay(peerTransit)
-		if err != nil {
-			returnErr = err
-			return nil, err
-		}
-	}
-
-	if conn == nil {
-		returnErr = errors.New("failed to establish transit connection")
-		return nil, returnErr
-	}
-
-	cryptor := newTransportCryptor(conn, transitKey, "transit_record_sender_key", "transit_record_receiver_key")
-	session := tunnel.NewSession(&cryptorAdapter{cryptor})
-
-	rc.Close(ctx, rendezvous.Happy)
-
-	return tunnel.NewTunnel(session), nil
+	return c.establishTunnel(ctx, rc, sideID, code, true)
 }
