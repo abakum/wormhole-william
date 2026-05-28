@@ -60,6 +60,33 @@ func waitForTransitMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (*tr
 	}
 }
 
+var ErrTunnelRoleConflict = errors.New("tunnel: both sides are creators")
+
+func readRoleMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (string, string, error) {
+	for {
+		msg, ok := <-ch
+		if !ok {
+			return "", "", errors.New("channel closed waiting for role")
+		}
+		if msg.Error != nil {
+			return "", "", msg.Error
+		}
+		if _, err := strconv.Atoi(msg.Phase); err != nil {
+			continue
+		}
+		var gm genericMessage
+		if err := openAndUnmarshal(&gm, msg, sharedKey); err != nil {
+			continue
+		}
+		if gm.Offer != nil && gm.Offer.Message != nil {
+			return *gm.Offer.Message, msg.Side, nil
+		}
+		if gm.Error != nil {
+			return "", "", fmt.Errorf("peer error: %s", *gm.Error)
+		}
+	}
+}
+
 func countTransitHints(t *transitMsg) (direct, relay int) {
 	for _, h := range t.HintsV1 {
 		switch h.Type {
@@ -90,7 +117,7 @@ func deterministicNameplates(secret string, count int) []string {
 	return candidates
 }
 
-func (c *Client) claimOrAllocateNameplate(ctx context.Context, secret string) (string, *rendezvous.Client, string, error) {
+func (c *Client) claimOrAllocateNameplate(ctx context.Context, secret string, isJoiner bool) (string, *rendezvous.Client, string, error) {
 	appID := c.tunnelAppID()
 
 	if secret == "" {
@@ -107,6 +134,20 @@ func (c *Client) claimOrAllocateNameplate(ctx context.Context, secret string) (s
 		return nameplate, rc, sideID, nil
 	}
 
+	if nameplate, err := nameplateFromCode(secret); err == nil {
+		sideID := crypto.RandSideID()
+		rc := rendezvous.NewClient(c.url(), sideID, appID)
+		if _, err := rc.Connect(ctx); err != nil {
+			return "", nil, "", err
+		}
+		if err := rc.AttachMailbox(ctx, nameplate); err != nil {
+			rc.Close(ctx, rendezvous.Errory)
+			return "", nil, "", fmt.Errorf("attach mailbox %s: %w", nameplate, err)
+		}
+		log.Printf("tunnel: claimed nameplate %s from code", nameplate)
+		return nameplate, rc, sideID, nil
+	}
+
 	candidates := deterministicNameplates(secret, 5)
 	for _, nameplate := range candidates {
 		sideID := crypto.RandSideID()
@@ -117,12 +158,28 @@ func (c *Client) claimOrAllocateNameplate(ctx context.Context, secret string) (s
 		}
 		if err := rc.AttachMailbox(ctx, nameplate); err != nil {
 			log.Printf("tunnel: nameplate %s busy (%v), trying next", nameplate, err)
+			rc.Close(ctx, rendezvous.Errory)
 			continue
 		}
 		log.Printf("tunnel: claimed deterministic nameplate %s", nameplate)
 		return nameplate, rc, sideID, nil
 	}
-	return "", nil, "", fmt.Errorf("all %d deterministic nameplates busy, try a different secret", len(candidates))
+
+	if isJoiner {
+		return "", nil, "", fmt.Errorf("all %d deterministic nameplates busy, try a different secret", len(candidates))
+	}
+
+	sideID := crypto.RandSideID()
+	rc := rendezvous.NewClient(c.url(), sideID, appID)
+	if _, err := rc.Connect(ctx); err != nil {
+		return "", nil, "", err
+	}
+	nameplate, err := rc.CreateMailbox(ctx)
+	if err != nil {
+		return "", nil, "", err
+	}
+	log.Printf("tunnel: all deterministic nameplates busy, allocated fallback nameplate %s", nameplate)
+	return nameplate, rc, sideID, nil
 }
 
 func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sideID, code string, isJoiner bool) (string, *tunnel.Tunnel, error) {
@@ -167,6 +224,33 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 			returnErr = errors.New("tunnel rejected by verification check")
 			return "", nil, returnErr
 		}
+	}
+
+	role := "creator"
+	if isJoiner {
+		role = "joiner"
+	}
+	if err := cp.WriteAppData(ctx, &genericMessage{Offer: &offerMsg{Message: &role}}); err != nil {
+		returnErr = err
+		return "", nil, err
+	}
+	peerRole, peerSideID, err := readRoleMsg(cp.ch, cp.sharedKey)
+	if err != nil {
+		returnErr = err
+		return "", nil, err
+	}
+	log.Printf("tunnel: role exchange complete (us=%s peer=%s)", role, peerRole)
+
+	if role == "creator" && peerRole == "creator" {
+		if sideID > peerSideID {
+			errStr := "tunnel: both sides are creators, backing off"
+			cp.WriteAppData(ctx, &genericMessage{Error: &errStr})
+			returnErr = fmt.Errorf("tunnel: both sides are creators, giving up")
+			return "", nil, returnErr
+		}
+		log.Printf("tunnel: both creators, peer will back off, retrying")
+		returnErr = ErrTunnelRoleConflict
+		return "", nil, returnErr
 	}
 
 	transitKey := deriveTransitKey(cp.sharedKey, appID)
@@ -278,19 +362,35 @@ func (c *Client) CreateTunnel(ctx context.Context, code string) (string, *tunnel
 
 	log.Printf("tunnel: connecting to rendezvous %s", c.url())
 
-	nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code)
-	if err != nil {
-		return "", nil, fmt.Errorf("claim nameplate: %w", err)
-	}
+	generatedCode := ""
+	const maxRoleConflictRetries = 3
+	for attempt := 0; ; attempt++ {
+		nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code, false)
+		if err != nil {
+			return "", nil, fmt.Errorf("claim nameplate: %w", err)
+		}
 
-	if code == "" {
-		code = nameplate + "-" + wordlist.ChooseWords(c.wordCount())
-		log.Printf("tunnel: created mailbox, code=%q", code)
-	} else {
-		log.Printf("tunnel: claimed nameplate %s for code", nameplate)
-	}
+		tunnelCode := code
+		if tunnelCode == "" {
+			if generatedCode == "" {
+				generatedCode = nameplate + "-" + wordlist.ChooseWords(c.wordCount())
+			}
+			tunnelCode = generatedCode
+			log.Printf("tunnel: created mailbox, code=%q", tunnelCode)
+		} else {
+			log.Printf("tunnel: claimed nameplate %s for code", nameplate)
+		}
 
-	return c.establishTunnel(ctx, rc, sideID, code, false)
+		result, t, err := c.establishTunnel(ctx, rc, sideID, tunnelCode, false)
+		if err != nil {
+			if errors.Is(err, ErrTunnelRoleConflict) && attempt < maxRoleConflictRetries {
+				log.Printf("tunnel: role conflict, retrying (%d/%d)...", attempt+1, maxRoleConflictRetries)
+				continue
+			}
+			return "", nil, err
+		}
+		return result, t, nil
+	}
 }
 
 func (c *Client) JoinTunnel(ctx context.Context, code string) (string, *tunnel.Tunnel, error) {
@@ -304,7 +404,7 @@ func (c *Client) JoinTunnel(ctx context.Context, code string) (string, *tunnel.T
 
 	log.Printf("tunnel: connecting to rendezvous %s", c.url())
 
-	nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code)
+	nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code, true)
 	if err != nil {
 		return "", nil, fmt.Errorf("claim nameplate: %w", err)
 	}

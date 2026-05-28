@@ -18,13 +18,19 @@ type RecordIO interface {
 	Close() error
 }
 
+type writeRequest struct {
+	data []byte
+	err  chan error
+}
+
 type Session struct {
-	rw      RecordIO
-	conns   sync.Map
-	nextID  uint64
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
-	writeMu sync.Mutex
+	rw        RecordIO
+	conns     sync.Map
+	nextID    uint64
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
+	controlCh chan writeRequest
+	dataCh    chan writeRequest
 
 	listenerMu sync.Mutex
 	listener   *tunnelListener
@@ -33,11 +39,20 @@ type Session struct {
 
 func NewSession(rw RecordIO) *Session {
 	s := &Session{
-		rw:     rw,
-		stopCh: make(chan struct{}),
+		rw:        rw,
+		stopCh:    make(chan struct{}),
+		controlCh: make(chan writeRequest, 64),
+		dataCh:    make(chan writeRequest, 256),
+		listener: &tunnelListener{
+			session: nil,
+			connCh:  make(chan *tunnelConn, 64),
+			closed:  make(chan struct{}),
+		},
 	}
-	s.wg.Add(1)
+	s.listener.session = s
+	s.wg.Add(2)
 	go s.readLoop()
+	go s.writeLoop()
 	return s
 }
 
@@ -54,11 +69,7 @@ func (s *Session) Dial(ctx context.Context, remoteAddr string) (net.Conn, error)
 
 	log.Printf("tunnel session: dialing %s (connID=%d)", remoteAddr, id)
 
-	s.writeMu.Lock()
-	err := s.rw.WriteRecord(EncodeOpen(id, remoteAddr))
-	s.writeMu.Unlock()
-
-	if err != nil {
+	if err := s.sendControl(EncodeOpen(id, remoteAddr)); err != nil {
 		s.conns.Delete(id)
 		return nil, fmt.Errorf("tunnel dial: %w", err)
 	}
@@ -67,14 +78,17 @@ func (s *Session) Dial(ctx context.Context, remoteAddr string) (net.Conn, error)
 }
 
 func (s *Session) Listen() net.Listener {
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
+	if s.listener != nil {
+		return s.listener
+	}
 	ln := &tunnelListener{
 		session: s,
 		connCh:  make(chan *tunnelConn, 64),
 		closed:  make(chan struct{}),
 	}
-	s.listenerMu.Lock()
 	s.listener = ln
-	s.listenerMu.Unlock()
 	return ln
 }
 
@@ -137,13 +151,6 @@ func (s *Session) handleOpen(msg Message) {
 	ln := s.listener
 	s.listenerMu.Unlock()
 
-	if ln == nil {
-		log.Printf("tunnel session: no listener, rejecting connID=%d", msg.ConnID)
-		s.sendClose(msg.ConnID)
-		s.conns.Delete(msg.ConnID)
-		return
-	}
-
 	select {
 	case ln.connCh <- conn:
 		log.Printf("tunnel session: accepted tunnel connID=%d", msg.ConnID)
@@ -177,16 +184,62 @@ func (s *Session) handleClose(msg Message) {
 }
 
 func (s *Session) sendData(connID uint64, data []byte) error {
-	s.writeMu.Lock()
-	err := s.rw.WriteRecord(EncodeData(connID, data))
-	s.writeMu.Unlock()
-	return err
+	return s.enqueueData(EncodeData(connID, data))
 }
 
 func (s *Session) sendClose(connID uint64) {
-	s.writeMu.Lock()
-	s.rw.WriteRecord(EncodeClose(connID))
-	s.writeMu.Unlock()
+	s.sendControl(EncodeClose(connID))
+}
+
+func (s *Session) sendControl(msg []byte) error {
+	req := writeRequest{data: msg, err: make(chan error, 1)}
+	select {
+	case s.controlCh <- req:
+	case <-s.stopCh:
+		return net.ErrClosed
+	}
+	select {
+	case err := <-req.err:
+		return err
+	case <-s.stopCh:
+		return net.ErrClosed
+	}
+}
+
+func (s *Session) enqueueData(msg []byte) error {
+	req := writeRequest{data: msg, err: make(chan error, 1)}
+	select {
+	case s.dataCh <- req:
+	case <-s.stopCh:
+		return net.ErrClosed
+	}
+	select {
+	case err := <-req.err:
+		return err
+	case <-s.stopCh:
+		return net.ErrClosed
+	}
+}
+
+func (s *Session) writeLoop() {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case req := <-s.controlCh:
+			req.err <- s.rw.WriteRecord(req.data)
+		default:
+		}
+		select {
+		case <-s.stopCh:
+			return
+		case req := <-s.controlCh:
+			req.err <- s.rw.WriteRecord(req.data)
+		case req := <-s.dataCh:
+			req.err <- s.rw.WriteRecord(req.data)
+		}
+	}
 }
 
 type tunnelConn struct {
