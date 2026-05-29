@@ -34,11 +34,16 @@ func main() {
 
 	log.Printf("rendezvous=%s transit=%s", *rendezvous, *transit)
 
-	generatedCode, t, err := c.CreateTunnel(ctx, *code)
+	generatedCode, connect, err := c.PrepareTunnel(ctx, *code)
 	if err != nil {
-		log.Fatalf("create tunnel: %v", err)
+		log.Fatalf("prepare tunnel: %v", err)
 	}
 	log.Printf("wormhole code: %s", generatedCode)
+
+	t, err := connect()
+	if err != nil {
+		log.Fatalf("connect tunnel: %v", err)
+	}
 	defer t.Close()
 	log.Printf("tunnel created, dialing %s", *dial)
 	if err := t.Serve(ctx, *dial); err != nil && ctx.Err() == nil {

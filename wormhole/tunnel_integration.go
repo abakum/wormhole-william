@@ -12,11 +12,12 @@ import (
 	"strconv"
 	"strings"
 
+	"crypto/sha256"
+
 	"github.com/psanford/wormhole-william/internal/crypto"
 	"github.com/psanford/wormhole-william/rendezvous"
-	"github.com/psanford/wormhole-william/wormhole/tunnel"
 	"github.com/psanford/wormhole-william/wordlist"
-	"crypto/sha256"
+	"github.com/psanford/wormhole-william/wormhole/tunnel"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -51,8 +52,7 @@ func waitForTransitMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (*tr
 			continue
 		}
 		if gm.Transit != nil {
-			directCount, relayCount := countTransitHints(gm.Transit)
-			log.Printf("tunnel: received peer transit hints (%d direct, %d relay)", directCount, relayCount)
+			// log.Printf("tunnel: received peer transit hints (%d direct, %d relay)", directCount, relayCount)
 			return gm.Transit, nil
 		}
 		if gm.Error != nil {
@@ -96,44 +96,51 @@ func readRoleMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (string, s
 	}
 }
 
-func negotiateRelay(ourRelay, peerRelay, ourRole string) string {
+// func relayLabel(addr string) string {
+// 	if addr == "" || addr == DefaultTransitRelayAddress {
+// 		return "default"
+// 	}
+// 	return "custom"
+// }
+
+func negotiateRelay(ourRelay, peerRelay, ourRole string) (string, string) {
 	ourCustom := ourRelay != "" && ourRelay != DefaultTransitRelayAddress
 	peerCustom := peerRelay != "" && peerRelay != DefaultTransitRelayAddress
 
 	switch {
 	case ourCustom && peerCustom:
 		if peerRelay == ourRelay {
-			return ourRelay
+			return ourRelay, "ours"
 		}
 		if ourRole == "creator" {
-			log.Printf("tunnel: relay conflict (us=%s peer=%s), creator wins → %s", ourRelay, peerRelay, ourRelay)
-			return ourRelay
+			log.Printf("tunnel: relay conflict, creator wins → ours")
+			return ourRelay, "ours"
 		}
-		log.Printf("tunnel: relay conflict (us=%s peer=%s), creator wins → %s", ourRelay, peerRelay, peerRelay)
-		return peerRelay
+		log.Printf("tunnel: relay conflict, creator wins → peer's")
+		return peerRelay, "peer's"
 	case ourCustom:
-		return ourRelay
+		return ourRelay, "ours"
 	case peerCustom:
-		return peerRelay
+		return peerRelay, "peer's"
 	default:
 		if ourRelay != "" {
-			return ourRelay
+			return ourRelay, "default"
 		}
-		return DefaultTransitRelayAddress
+		return DefaultTransitRelayAddress, "default"
 	}
 }
 
-func countTransitHints(t *transitMsg) (direct, relay int) {
-	for _, h := range t.HintsV1 {
-		switch h.Type {
-		case "direct-tcp-v1":
-			direct++
-		case "relay-v1":
-			relay++
-		}
-	}
-	return
-}
+// func countTransitHints(t *transitMsg) (direct, relay int) {
+// 	for _, h := range t.HintsV1 {
+// 		switch h.Type {
+// 		case "direct-tcp-v1":
+// 			direct++
+// 		case "relay-v1":
+// 			relay++
+// 		}
+// 	}
+// 	return
+// }
 
 func deterministicNameplates(secret string, count int) []string {
 	candidates := make([]string, count)
@@ -166,7 +173,7 @@ func (c *Client) claimOrAllocateNameplate(ctx context.Context, secret string, is
 		if err != nil {
 			return "", nil, "", err
 		}
-		log.Printf("tunnel: allocated nameplate %s", nameplate)
+		// log.Printf("tunnel: allocated nameplate %s", nameplate)
 		return nameplate, rc, sideID, nil
 	}
 
@@ -180,7 +187,7 @@ func (c *Client) claimOrAllocateNameplate(ctx context.Context, secret string, is
 			rc.Close(ctx, rendezvous.Errory)
 			return "", nil, "", fmt.Errorf("attach mailbox %s: %w", nameplate, err)
 		}
-		log.Printf("tunnel: claimed nameplate %s from code", nameplate)
+		// log.Printf("tunnel: claimed nameplate %s from code", nameplate)
 		return nameplate, rc, sideID, nil
 	}
 
@@ -189,15 +196,15 @@ func (c *Client) claimOrAllocateNameplate(ctx context.Context, secret string, is
 		sideID := crypto.RandSideID()
 		rc := rendezvous.NewClient(c.url(), sideID, appID)
 		if _, err := rc.Connect(ctx); err != nil {
-			log.Printf("tunnel: connect failed for nameplate %s: %v", nameplate, err)
+			// log.Printf("tunnel: connect failed for nameplate %s: %v", nameplate, err)
 			continue
 		}
 		if err := rc.AttachMailbox(ctx, nameplate); err != nil {
-			log.Printf("tunnel: nameplate %s busy (%v), trying next", nameplate, err)
+			// log.Printf("tunnel: nameplate %s busy (%v), trying next", nameplate, err)
 			rc.Close(ctx, rendezvous.Errory)
 			continue
 		}
-		log.Printf("tunnel: claimed deterministic nameplate %s", nameplate)
+		// log.Printf("tunnel: claimed deterministic nameplate %s", nameplate)
 		return nameplate, rc, sideID, nil
 	}
 
@@ -248,7 +255,7 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 		returnErr = err
 		return "", nil, err
 	}
-	log.Printf("tunnel: version exchange complete")
+	// log.Printf("tunnel: version exchange complete")
 
 	if c.VerifierOk != nil {
 		verifier, err := cp.Verifier()
@@ -279,7 +286,7 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 		returnErr = err
 		return "", nil, err
 	}
-	log.Printf("tunnel: role exchange complete (us=%s peer=%s peerRelay=%q)", role, peerRole, peerRelay)
+	// log.Printf("tunnel: role exchange complete (us=%s peer=%s peerRelay=%s)", role, peerRole, relayLabel(peerRelay))
 
 	if role == "creator" && peerRole == "creator" {
 		if sideID > peerSideID {
@@ -293,15 +300,15 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 		return "", nil, returnErr
 	}
 
-	effectiveRelay := negotiateRelay(c.relayAddr(), peerRelay, role)
-	log.Printf("tunnel: effective relay=%s", effectiveRelay)
+	effectiveRelay, _ := negotiateRelay(c.relayAddr(), peerRelay, role)
+	// log.Printf("tunnel: relay=%s", relayLabel)
 
 	transitKey := deriveTransitKey(cp.sharedKey, appID)
 	transport := newFileTransport(transitKey, appID, effectiveRelay)
 	transport.includeLoopback = true
 
 	if isJoiner {
-		log.Printf("tunnel: waiting for peer transit hints...")
+		// log.Printf("tunnel: waiting for peer transit hints...")
 		peerTransit, err := waitForTransitMsg(cp.ch, cp.sharedKey)
 		if err != nil {
 			returnErr = err
@@ -319,7 +326,7 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 			return "", nil, err
 		}
 
-		log.Printf("tunnel: trying direct connection to peer...")
+		// log.Printf("tunnel: trying direct connection to peer...")
 		conn, err := transport.connectDirect(peerTransit)
 		if err != nil {
 			returnErr = err
@@ -329,7 +336,7 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 		if conn != nil {
 			log.Printf("tunnel: transit connection established via direct-tcp from %s", conn.RemoteAddr())
 		} else {
-			log.Printf("tunnel: direct connection failed, trying relay...")
+			// log.Printf("tunnel: direct connection failed, trying relay...")
 			conn, err = transport.connectViaRelay(peerTransit)
 			if err != nil {
 				returnErr = err
@@ -368,8 +375,8 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 		return "", nil, err
 	}
 
-	directCount, relayCount := countTransitHints(transitMsg)
-	log.Printf("tunnel: transit listening (direct hints=%d, relay hints=%d, relay addr=%s)", directCount, relayCount, effectiveRelay)
+	// directCount, relayCount := countTransitHints(transitMsg)
+	// log.Printf("tunnel: transit listening (direct hints=%d, relay hints=%d)", directCount, relayCount)
 
 	if err := cp.WriteAppData(ctx, &genericMessage{Transit: transitMsg}); err != nil {
 		returnErr = err
@@ -382,7 +389,7 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 		return "", nil, err
 	}
 
-	log.Printf("tunnel: waiting for incoming transit connection...")
+	// log.Printf("tunnel: waiting for incoming transit connection...")
 	conn, err := transport.acceptConnection(ctx)
 	if err != nil {
 		returnErr = err
@@ -399,42 +406,54 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 	return code, tunnel.NewTunnel(session), nil
 }
 
-func (c *Client) CreateTunnel(ctx context.Context, code string) (string, *tunnel.Tunnel, error) {
+func (c *Client) PrepareTunnel(ctx context.Context, code string) (string, func() (*tunnel.Tunnel, error), error) {
 	if err := c.validateRelayAddr(); err != nil {
 		return "", nil, fmt.Errorf("invalid TransitRelayAddress: %s", err)
 	}
 
-	log.Printf("tunnel: connecting to rendezvous %s", c.url())
-
-	generatedCode := ""
-	const maxRoleConflictRetries = 3
-	for attempt := 0; ; attempt++ {
-		nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code, false)
-		if err != nil {
-			return "", nil, fmt.Errorf("claim nameplate: %w", err)
-		}
-
-		tunnelCode := code
-		if tunnelCode == "" {
-			if generatedCode == "" {
-				generatedCode = nameplate + "-" + wordlist.ChooseWords(c.wordCount())
-			}
-			tunnelCode = generatedCode
-			log.Printf("tunnel: created mailbox, code=%q", tunnelCode)
-		} else {
-			log.Printf("tunnel: claimed nameplate %s for code", nameplate)
-		}
-
-		result, t, err := c.establishTunnel(ctx, rc, sideID, tunnelCode, false)
-		if err != nil {
-			if errors.Is(err, ErrTunnelRoleConflict) && attempt < maxRoleConflictRetries {
-				log.Printf("tunnel: role conflict, retrying (%d/%d)...", attempt+1, maxRoleConflictRetries)
-				continue
-			}
-			return "", nil, err
-		}
-		return result, t, nil
+	nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code, false)
+	if err != nil {
+		return "", nil, fmt.Errorf("claim nameplate: %w", err)
 	}
+
+	generatedCode := code
+	if generatedCode == "" {
+		generatedCode = nameplate + "-" + wordlist.ChooseWords(c.wordCount())
+	}
+
+	return generatedCode, func() (*tunnel.Tunnel, error) {
+		const maxRoleConflictRetries = 3
+		curRC := rc
+		curSideID := sideID
+		for attempt := 0; ; attempt++ {
+			_, t, err := c.establishTunnel(ctx, curRC, curSideID, generatedCode, false)
+			if err != nil {
+				if errors.Is(err, ErrTunnelRoleConflict) && attempt < maxRoleConflictRetries {
+					log.Printf("tunnel: role conflict, retrying (%d/%d)...", attempt+1, maxRoleConflictRetries)
+					curRC.Close(ctx, rendezvous.Errory)
+					_, curRC, curSideID, err = c.claimOrAllocateNameplate(ctx, code, false)
+					if err != nil {
+						return nil, fmt.Errorf("claim nameplate: %w", err)
+					}
+					continue
+				}
+				return nil, err
+			}
+			return t, nil
+		}
+	}, nil
+}
+
+func (c *Client) CreateTunnel(ctx context.Context, code string) (string, *tunnel.Tunnel, error) {
+	code, connect, err := c.PrepareTunnel(ctx, code)
+	if err != nil {
+		return "", nil, err
+	}
+	t, err := connect()
+	if err != nil {
+		return "", nil, err
+	}
+	return code, t, nil
 }
 
 func (c *Client) JoinTunnel(ctx context.Context, code string) (string, *tunnel.Tunnel, error) {
@@ -446,14 +465,14 @@ func (c *Client) JoinTunnel(ctx context.Context, code string) (string, *tunnel.T
 		return "", nil, errors.New("join tunnel: code is required")
 	}
 
-	log.Printf("tunnel: connecting to rendezvous %s", c.url())
+	// log.Printf("tunnel: connecting to rendezvous %s", c.url())
 
-	nameplate, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code, true)
+	_, rc, sideID, err := c.claimOrAllocateNameplate(ctx, code, true)
 	if err != nil {
 		return "", nil, fmt.Errorf("claim nameplate: %w", err)
 	}
 
-	log.Printf("tunnel: claimed nameplate %s for code", nameplate)
+	// log.Printf("tunnel: claimed nameplate %s for code", nameplate)
 
 	return c.establishTunnel(ctx, rc, sideID, code, true)
 }

@@ -47,7 +47,7 @@ func (t *Tunnel) Forward(ctx context.Context, localAddr string) error {
 		select {
 		case <-ctx.Done():
 		case <-t.session.stopCh:
-			log.Printf("tunnel forward: session closed, shutting down")
+			// log.Printf("tunnel forward: session closed, shutting down")
 		}
 		ln.Close()
 	}()
@@ -65,7 +65,7 @@ func (t *Tunnel) Forward(ctx context.Context, localAddr string) error {
 		go func(localConn net.Conn) {
 			defer localConn.Close()
 			remoteAddr := localConn.RemoteAddr().String()
-			log.Printf("tunnel forward: accepted connection from %s, opening tunnel", remoteAddr)
+			// log.Printf("tunnel forward: accepted connection from %s, opening tunnel", remoteAddr)
 			tunnelConn, err := t.Dial(ctx, remoteAddr)
 			if err != nil {
 				log.Printf("tunnel forward: failed to dial tunnel: %v", err)
@@ -73,7 +73,7 @@ func (t *Tunnel) Forward(ctx context.Context, localAddr string) error {
 			}
 			defer tunnelConn.Close()
 			Proxy(localConn, tunnelConn)
-			log.Printf("tunnel forward: connection from %s closed", remoteAddr)
+			// log.Printf("tunnel forward: connection from %s closed", remoteAddr)
 		}(conn)
 	}
 }
@@ -88,7 +88,7 @@ func (t *Tunnel) Serve(ctx context.Context, localAddr string) error {
 		select {
 		case <-ctx.Done():
 		case <-t.session.stopCh:
-			log.Printf("tunnel serve: session closed, shutting down")
+			// log.Printf("tunnel serve: session closed, shutting down")
 		}
 		ln.Close()
 	}()
@@ -105,16 +105,16 @@ func (t *Tunnel) Serve(ctx context.Context, localAddr string) error {
 		}
 		go func(tc net.Conn) {
 			defer tc.Close()
-			log.Printf("tunnel serve: got tunnel connection from %s, dialing %s", tc.RemoteAddr(), localAddr)
+			// log.Printf("tunnel serve: got tunnel connection from %s, dialing %s", tc.RemoteAddr(), localAddr)
 			localConn, err := net.Dial("tcp", localAddr)
 			if err != nil {
 				log.Printf("tunnel serve: failed to dial %s: %v", localAddr, err)
 				return
 			}
 			defer localConn.Close()
-			log.Printf("tunnel serve: connected to %s, proxying", localAddr)
+			// log.Printf("tunnel serve: connected to %s, proxying", localAddr)
 			Proxy(localConn, tc)
-			log.Printf("tunnel serve: connection to %s closed", localAddr)
+			// log.Printf("tunnel serve: connection to %s closed", localAddr)
 		}(tunnelConn)
 	}
 }
