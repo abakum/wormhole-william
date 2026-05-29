@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/psanford/wormhole-william/internal/crypto"
 	"github.com/psanford/wormhole-william/rendezvous"
@@ -62,14 +63,21 @@ func waitForTransitMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (*tr
 
 var ErrTunnelRoleConflict = errors.New("tunnel: both sides are creators")
 
-func readRoleMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (string, string, error) {
+func parseRoleMsg(text string) (role, relayAddr string) {
+	if idx := strings.LastIndex(text, "/"); idx >= 0 {
+		return text[idx+1:], text[:idx]
+	}
+	return text, ""
+}
+
+func readRoleMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (string, string, string, error) {
 	for {
 		msg, ok := <-ch
 		if !ok {
-			return "", "", errors.New("channel closed waiting for role")
+			return "", "", "", errors.New("channel closed waiting for role")
 		}
 		if msg.Error != nil {
-			return "", "", msg.Error
+			return "", "", "", msg.Error
 		}
 		if _, err := strconv.Atoi(msg.Phase); err != nil {
 			continue
@@ -79,11 +87,39 @@ func readRoleMsg(ch <-chan rendezvous.MailboxEvent, sharedKey []byte) (string, s
 			continue
 		}
 		if gm.Offer != nil && gm.Offer.Message != nil {
-			return *gm.Offer.Message, msg.Side, nil
+			role, relay := parseRoleMsg(*gm.Offer.Message)
+			return role, relay, msg.Side, nil
 		}
 		if gm.Error != nil {
-			return "", "", fmt.Errorf("peer error: %s", *gm.Error)
+			return "", "", "", fmt.Errorf("peer error: %s", *gm.Error)
 		}
+	}
+}
+
+func negotiateRelay(ourRelay, peerRelay, ourRole string) string {
+	ourCustom := ourRelay != "" && ourRelay != DefaultTransitRelayAddress
+	peerCustom := peerRelay != "" && peerRelay != DefaultTransitRelayAddress
+
+	switch {
+	case ourCustom && peerCustom:
+		if peerRelay == ourRelay {
+			return ourRelay
+		}
+		if ourRole == "creator" {
+			log.Printf("tunnel: relay conflict (us=%s peer=%s), creator wins → %s", ourRelay, peerRelay, ourRelay)
+			return ourRelay
+		}
+		log.Printf("tunnel: relay conflict (us=%s peer=%s), creator wins → %s", ourRelay, peerRelay, peerRelay)
+		return peerRelay
+	case ourCustom:
+		return ourRelay
+	case peerCustom:
+		return peerRelay
+	default:
+		if ourRelay != "" {
+			return ourRelay
+		}
+		return DefaultTransitRelayAddress
 	}
 }
 
@@ -230,16 +266,20 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 	if isJoiner {
 		role = "joiner"
 	}
-	if err := cp.WriteAppData(ctx, &genericMessage{Offer: &offerMsg{Message: &role}}); err != nil {
+	roleMsg := role
+	if c.TransitRelayAddress != "" && c.TransitRelayAddress != DefaultTransitRelayAddress {
+		roleMsg = c.TransitRelayAddress + "/" + role
+	}
+	if err := cp.WriteAppData(ctx, &genericMessage{Offer: &offerMsg{Message: &roleMsg}}); err != nil {
 		returnErr = err
 		return "", nil, err
 	}
-	peerRole, peerSideID, err := readRoleMsg(cp.ch, cp.sharedKey)
+	peerRole, peerRelay, peerSideID, err := readRoleMsg(cp.ch, cp.sharedKey)
 	if err != nil {
 		returnErr = err
 		return "", nil, err
 	}
-	log.Printf("tunnel: role exchange complete (us=%s peer=%s)", role, peerRole)
+	log.Printf("tunnel: role exchange complete (us=%s peer=%s peerRelay=%q)", role, peerRole, peerRelay)
 
 	if role == "creator" && peerRole == "creator" {
 		if sideID > peerSideID {
@@ -253,8 +293,11 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 		return "", nil, returnErr
 	}
 
+	effectiveRelay := negotiateRelay(c.relayAddr(), peerRelay, role)
+	log.Printf("tunnel: effective relay=%s", effectiveRelay)
+
 	transitKey := deriveTransitKey(cp.sharedKey, appID)
-	transport := newFileTransport(transitKey, appID, c.relayAddr())
+	transport := newFileTransport(transitKey, appID, effectiveRelay)
 	transport.includeLoopback = true
 
 	if isJoiner {
@@ -326,7 +369,7 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 	}
 
 	directCount, relayCount := countTransitHints(transitMsg)
-	log.Printf("tunnel: transit listening (direct hints=%d, relay hints=%d, relay addr=%s)", directCount, relayCount, c.relayAddr())
+	log.Printf("tunnel: transit listening (direct hints=%d, relay hints=%d, relay addr=%s)", directCount, relayCount, effectiveRelay)
 
 	if err := cp.WriteAppData(ctx, &genericMessage{Transit: transitMsg}); err != nil {
 		returnErr = err
