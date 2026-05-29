@@ -255,6 +255,7 @@ func (c *Client) establishTunnel(ctx context.Context, rc *rendezvous.Client, sid
 
 	transitKey := deriveTransitKey(cp.sharedKey, appID)
 	transport := newFileTransport(transitKey, appID, c.relayAddr())
+	transport.includeLoopback = true
 
 	if isJoiner {
 		log.Printf("tunnel: waiting for peer transit hints...")

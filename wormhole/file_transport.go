@@ -163,11 +163,12 @@ func newFileTransport(transitKey []byte, appID, relayAddr string) *fileTransport
 }
 
 type fileTransport struct {
-	listener   net.Listener
-	relayConn  net.Conn
-	relayAddr  string
-	transitKey []byte
-	appID      string
+	listener       net.Listener
+	relayConn      net.Conn
+	relayAddr      string
+	transitKey     []byte
+	appID          string
+	includeLoopback bool
 }
 
 func (t *fileTransport) connectViaRelay(otherTransit *transitMsg) (net.Conn, error) {
@@ -376,6 +377,15 @@ func (t *fileTransport) makeTransitMsg() (*transitMsg, error) {
 				Type:     "direct-tcp-v1",
 				Priority: 0.0,
 				Hostname: addr,
+				Port:     port,
+			})
+		}
+
+		if t.includeLoopback {
+			msg.HintsV1 = append(msg.HintsV1, transitHintsV1{
+				Type:     "direct-tcp-v1",
+				Priority: 0.0,
+				Hostname: "127.0.0.1",
 				Port:     port,
 			})
 		}
@@ -616,18 +626,36 @@ func (t *fileTransport) handleIncomingConnection(conn net.Conn, readyCh chan<- n
 }
 
 var nonLocalhostAddresses = func() []string {
-	addrs, err := net.InterfaceAddrs()
+	interfaces, err := net.Interfaces()
 	if err != nil {
-		return nil
+		// for Android
+		conn, err := net.Dial("udp", "8.8.8.8:80")
+		if err != nil {
+			return nil
+		}
+		defer conn.Close()
+		return []string{conn.LocalAddr().(*net.UDPAddr).IP.String()}
 	}
 
 	dedupAddrs := make(map[string]struct{})
 
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				dedupAddrs[ipnet.IP.String()] = struct{}{}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
 			}
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.To4() == nil {
+				continue
+			}
+			dedupAddrs[ip.String()] = struct{}{}
 		}
 	}
 
